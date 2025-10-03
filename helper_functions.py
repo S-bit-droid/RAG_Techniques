@@ -1,138 +1,132 @@
-from langchain_community.document_loaders import PyPDFLoader
+from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import FAISS
+from langchain.embeddings import GoogleEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chat_models import ChatGoogle
 from pydantic import BaseModel, Field
 from langchain import PromptTemplate
-from google.api_core.exceptions import ResourceExhausted  # instead of openai.RateLimitError
 from typing import List
-from rank_bm25 import BM25Okapi
 import fitz
+import textwrap
 import asyncio
 import random
-import textwrap
 import numpy as np
 from enum import Enum
+from rank_bm25 import BM25Okapi
 
+# --------------------------
+# Helper Functions
+# --------------------------
 
 def replace_t_with_space(list_of_documents):
-    """Replaces all tab characters ('\t') with spaces in document page content."""
     for doc in list_of_documents:
         doc.page_content = doc.page_content.replace('\t', ' ')
     return list_of_documents
 
-
 def text_wrap(text, width=120):
-    """Wraps the input text to the specified width."""
     return textwrap.fill(text, width=width)
 
-
 def encode_pdf(path, chunk_size=1000, chunk_overlap=200):
-    """Encodes a PDF into a FAISS vectorstore with Gemini embeddings."""
     loader = PyPDFLoader(path)
     documents = loader.load()
-
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, length_function=len
     )
     texts = text_splitter.split_documents(documents)
     cleaned_texts = replace_t_with_space(texts)
-
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embeddings = GoogleEmbeddings()
     vectorstore = FAISS.from_documents(cleaned_texts, embeddings)
     return vectorstore
 
-
 def encode_from_string(content, chunk_size=1000, chunk_overlap=200):
-    """Encodes a string into FAISS vectorstore using Gemini embeddings."""
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Content must be a non-empty string.")
-
-    if not isinstance(chunk_size, int) or chunk_size <= 0:
-        raise ValueError("chunk_size must be a positive integer.")
-
-    if not isinstance(chunk_overlap, int) or chunk_overlap < 0:
-        raise ValueError("chunk_overlap must be a non-negative integer.")
-
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            is_separator_regex=False,
-        )
-        chunks = text_splitter.create_documents([content])
-
-        for chunk in chunks:
-            chunk.metadata['relevance_score'] = 1.0
-
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vectorstore = FAISS.from_documents(chunks, embeddings)
-
-    except Exception as e:
-        raise RuntimeError(f"Encoding error: {str(e)}")
-
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, length_function=len
+    )
+    chunks = text_splitter.create_documents([content])
+    for chunk in chunks:
+        chunk.metadata['relevance_score'] = 1.0
+    embeddings = GoogleEmbeddings()
+    vectorstore = FAISS.from_documents(chunks, embeddings)
     return vectorstore
 
-
 def retrieve_context_per_question(question, chunks_query_retriever):
-    """Retrieves relevant context for a given question."""
     docs = chunks_query_retriever.get_relevant_documents(question)
     return [doc.page_content for doc in docs]
 
+def show_context(context):
+    for i, c in enumerate(context):
+        print(f"Context {i+1}:\n{c}\n")
 
+def read_pdf_to_string(path):
+    doc = fitz.open(path)
+    content = ""
+    for page in doc:
+        content += page.get_text()
+    return content
+
+# --------------------------
+# Structured Output Model
+# --------------------------
 class QuestionAnswerFromContext(BaseModel):
-    """Model to generate an answer from given context."""
     answer_based_on_content: str = Field(
-        description="Answer to a query based only on the provided context."
+        description="Generates an answer to a query based on a given context."
     )
 
-
-def create_question_answer_from_context_chain():
-    """Creates a chain for answering questions using Gemini."""
-    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
-
+def create_question_answer_from_context_chain(llm):
     question_answer_prompt_template = """ 
     For the question below, provide a concise answer based ONLY on the provided context:
     {context}
-    Question:
+    Question
     {question}
     """
+    prompt = PromptTemplate(template=question_answer_prompt_template, input_variables=["context", "question"])
+    chain = prompt | llm.with_structured_output(QuestionAnswerFromContext)
+    return chain
 
-    question_answer_from_context_prompt = PromptTemplate(
-        template=question_answer_prompt_template,
-        input_variables=["context", "question"],
-    )
-
-    return (
-        question_answer_from_context_prompt
-        | llm.with_structured_output(QuestionAnswerFromContext)
-    )
-
-
-def answer_question_from_context(question, context, question_answer_from_context_chain):
-    """Answer a question using context by invoking the chain."""
+def answer_question_from_context(question, context, chain):
     input_data = {"question": question, "context": context}
-    print("Answering question from context...")
-    output = question_answer_from_context_chain.invoke(input_data)
+    output = chain.invoke(input_data)
     return {"answer": output.answer_based_on_content, "context": context, "question": question}
 
+# --------------------------
+# Async Retry Utilities
+# --------------------------
+async def exponential_backoff(attempt):
+    wait_time = (2 ** attempt) + random.uniform(0, 1)
+    await asyncio.sleep(wait_time)
 
-def show_context(context):
-    """Prints retrieved context chunks."""
-    for i, c in enumerate(context):
-        print(f"Context {i + 1}:\n{c}\n")
+async def retry_with_exponential_backoff(coroutine, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            return await coroutine
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            await exponential_backoff(attempt)
 
+# --------------------------
+# Enums & Embedding Provider
+# --------------------------
+class EmbeddingProvider(Enum):
+    GOOGLE = "google"
+    COHERE = "cohere"
+    AMAZON_BEDROCK = "bedrock"
 
-def read_pdf_to_string(path):
-    """Reads a PDF file and returns its text as a string."""
-    doc = fitz.open(path)
-    return "".join(page.get_text() for page in doc)
+class ModelProvider(Enum):
+    GOOGLE = "google"
+    COHERE = "cohere"
+    AMAZON_BEDROCK = "bedrock"
 
-
-def bm25_retrieval(bm25: BM25Okapi, cleaned_texts: List[str], query: str, k: int = 5) -> List[str]:
-    """Perform BM25 retrieval for top-k relevant chunks."""
-    query_tokens = query.split()
-    bm25_scores = bm25.get_scores(query_tokens)
-    top_k_indices = np.argsort(bm25_scores)[::-1][:k]
-    return [cleaned_texts_]()
+def get_langchain_embedding_provider(provider: EmbeddingProvider, model_id: str = None):
+    if provider == EmbeddingProvider.GOOGLE:
+        return GoogleEmbeddings(model=model_id) if model_id else GoogleEmbeddings()
+    elif provider == EmbeddingProvider.COHERE:
+        from langchain_cohere import CohereEmbeddings
+        return CohereEmbeddings()
+    elif provider == EmbeddingProvider.AMAZON_BEDROCK:
+        from langchain_community.embeddings import BedrockEmbeddings
+        return BedrockEmbeddings(model_id=model_id) if model_id else BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0")
+    else:
+        raise ValueError(f"Unsupported embedding provider: {provider}")
