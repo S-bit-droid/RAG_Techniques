@@ -6,7 +6,7 @@ using various metrics from the deepeval library.
 
 Dependencies:
 - deepeval
-- langchain_openai
+- langchain_google_genai
 - json
 
 Custom modules:
@@ -19,7 +19,7 @@ from typing import List, Tuple, Dict, Any
 from deepeval import evaluate
 from deepeval.metrics import GEval, FaithfulnessMetric, ContextualRelevancyMetric
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI   # Changed for Gemini
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -70,7 +70,7 @@ def create_deep_eval_test_cases(
 # Define evaluation metrics
 correctness_metric = GEval(
     name="Correctness",
-    model="gpt-4-turbo",
+    model="gemini-1.5-flash",   # Use Gemini here
     evaluation_params=[
         LLMTestCaseParams.EXPECTED_OUTPUT,
         LLMTestCaseParams.ACTUAL_OUTPUT
@@ -82,13 +82,13 @@ correctness_metric = GEval(
 
 faithfulness_metric = FaithfulnessMetric(
     threshold=0.7,
-    model="gpt-4-turbo",
+    model="gemini-1.5-flash",   # Gemini
     include_reason=False
 )
 
 relevance_metric = ContextualRelevancyMetric(
     threshold=1,
-    model="gpt-4-turbo",
+    model="gemini-1.5-flash",   # Gemini
     include_reason=True
 )
 
@@ -104,8 +104,8 @@ def evaluate_rag(retriever, num_questions: int = 5) -> Dict[str, Any]:
         Dict containing evaluation metrics
     """
     
-    # Initialize LLM
-    llm = ChatOpenAI(temperature=0, model_name="gpt-4-turbo-preview")
+    # Initialize LLM (Gemini)
+    llm = ChatGoogleGenerativeAI(temperature=0, model="gemini-1.5-flash")   # Changed
     
     # Create evaluation prompt
     eval_prompt = PromptTemplate.from_template("""
